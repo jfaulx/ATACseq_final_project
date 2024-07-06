@@ -1,0 +1,348 @@
+rule all:
+	input:
+		#multiqc 
+		'results/multiqc_report.html',
+		#samtools index2
+		expand('results/shifted/{rep}_shifted_sorted.done',rep=['ATACrep3','ATACrep4']),
+		#ATACseqQC
+		expand('results/{rep}_fragplot.jpeg',rep=['ATACrep3','ATACrep4']),
+		#plotMatrix
+		expand('results/matrixplot_{rep}.png',rep=['ATACrep3_NBR','ATACrep4_NBR','ATACrep3_NFR','ATACrep4_NFR']),
+		#annotate peaks
+		'results/analysis/annotated.txt',
+		#motifs
+		directory('results/analysis/motifs'),
+		#bowtie2 build
+		'results/index/full.3.bt2'
+
+
+
+rule fastqc:
+	input:
+		fastq = '/projectnb/bf528/materials/project_3_individual/atacseq/{rep}_{read}.fastq.gz'
+	output:
+		fastqc = 'results/fastqc/{rep}_{read}_fastqc.zip'
+	params:
+		outdir = 'results/fastqc'
+	threads: 4
+	conda:
+		'envs/fastqc_env.yml'
+	shell:
+		'''
+		fastqc -o {params.outdir} {input.fastq}
+		'''
+
+rule trimmomatic:
+	input:
+		trimput1 = '/projectnb/bf528/materials/project_3_individual/atacseq/{rep}_R1.fastq.gz',
+		trimput2 = '/projectnb/bf528/materials/project_3_individual/atacseq/{rep}_R2.fastq.gz'
+	output:
+		trimout = 'results/trimmed/{rep}_trimFP.fastq.gz',
+		trimout2 = 'results/trimmed/{rep}_trimRP.fastq.gz'
+	params:
+		adapters = 'results/NexteraPE-PE.fa',
+		outdir = 'results/trimmed'
+	threads: 8
+	conda:
+		'envs/trimmomatic_env.yml'
+	shell:
+		'''
+		trimmomatic PE -threads {threads} \
+		-trimlog trim.log {input.trimput1} {input.trimput2} \
+		{params.outdir}/{wildcards.rep}_trimFP.fastq.gz {params.outdir}/{wildcards.rep}_trimFU.fastq.gz \
+		{params.outdir}/{wildcards.rep}_trimRP.fastq.gz {params.outdir}/{wildcards.rep}_trimRU.fastq.gz \
+		ILLUMINACLIP:{params.adapters}:2:30:10 LEADING:3 TRAILING:3
+		'''
+
+rule bowtie2_build_gencode:
+	input: 
+		genome = 'results/index/GRCh38.primary_assembly.genome.fa'
+	output:
+		out = 'results/index/full.3.bt2'
+	params:
+		names = 'results/index/full'
+	threads: 16
+	conda:
+		'envs/bowtie2_env.yml'
+	shell:
+		'''
+		bowtie2-build {input.genome} {params.names}
+		'''
+
+rule bowtie2_align:
+	input:
+		fastq1 = 'results/trimmed/{rep}_trimFP.fastq.gz',
+		fastq2 = 'results/trimmed/{rep}_trimRP.fastq.gz',
+		ind = 'results/index/full.3.bt2'
+	output:
+		out = 'results/aligned/{rep}_aligned.bam'
+	threads: 16
+	params:
+		ind = 'results/index/full'
+	conda:
+		'envs/bowtie2_env.yml'
+	shell:
+		'''
+		bowtie2 -X 2000 -x {params.ind} -1 {input.fastq1} -2 {input.fastq2} | samtools view -bS - > {output.out} 
+		'''
+
+rule samtools_sort:
+	input: 
+		aligned = 'results/aligned/{rep}_aligned.bam'
+	output:
+		out = 'results/aligned/{rep}_sorted.bam'
+	conda:
+		'envs/samtools_env.yml'
+	threads: 16
+	shell:
+		'''
+		samtools sort {input.aligned} -o {output.out} 
+		'''
+
+rule samtools_flagstat:
+	input:
+		BAM = 'results/aligned/{rep}_sorted.bam'
+	output:
+		textout = 'results/aligned/{rep}_alignQC.txt'
+	params:
+		outdir = 'results/aligned'
+	conda:
+		'envs/samtools_env.yml'
+	threads: 16
+	shell:
+		'''
+		samtools flagstat {input.BAM} > {output.textout} 
+		'''
+
+rule multiqc:
+	input:
+		flag = expand('results/aligned/{rep}_alignQC.txt',rep=['ATACrep3','ATACrep4']),
+		qc = expand('results/fastqc/{rep}_{read}_fastqc.zip',rep=['ATACrep3','ATACrep4'],read=['R1','R2'])
+	output:
+		out = 'results/multiqc_report.html'
+	params:
+		index = 'results/'
+	conda:
+		'envs/multiqc_env.yml'
+	shell:
+		'''
+		multiqc -o {params.index} {input.flag} {input.qc}
+		'''
+
+rule remove_MT:
+	input:
+		BAM = 'results/aligned/{rep}_sorted.bam'
+	output:
+		removed = 'results/aligned/{rep}.rmChrM.bam'
+	conda:
+		'envs/samtools_env.yml'
+	threads: 16
+	shell:
+		'''
+		samtools view -h {input.BAM} | grep -v chrM | samtools sort -O bam -o {output.removed} -T {wildcards.rep}
+		'''
+
+rule samtools_idx:
+	input:
+		sorted = 'results/aligned/{rep}.rmChrM.bam'
+	output:
+		out = touch('results/aligned/{rep}_sorted.done')
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools index {input.sorted}
+		'''
+
+rule shift_reads:
+	input:
+		srinput = 'results/aligned/{rep}.rmChrM.bam',
+		idx = 'results/aligned/{rep}_sorted.done'
+	output:
+		out = 'results/aligned/{rep}_shifted.bam'
+	conda:
+		'envs/deeptools_env.yml'
+	threads: 16
+	shell:
+		'''
+		alignmentSieve --ATACshift -bl hg38-blacklist.v2.bed -p {threads} -b {input.srinput} -o {output.out}
+		'''
+
+rule samtools_sort2:
+	input: 
+		aligned = 'results/aligned/{rep}_shifted.bam'
+	output:
+		out = 'results/shifted/{rep}_shifted_sorted.bam'
+	conda:
+		'envs/samtools_env.yml'
+	threads: 16
+	shell:
+		'''
+		samtools sort {input.aligned} -o {output.out} 
+		'''
+
+rule samtools_idx2:
+	input:
+		sorted = 'results/shifted/{rep}_shifted_sorted.bam'
+	output:
+		out = touch('results/shifted/{rep}_shifted_sorted.done')
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools index {input.sorted}
+		'''
+
+rule samtools_flagstat2:
+	input:
+		BAM = 'results/shifted/{rep}_shifted_sorted.bam'
+	output:
+		textout = 'results/shifted/{rep}_shifted_alignQC.txt'
+	params:
+		outdir = 'results/shifted'
+	conda:
+		'envs/samtools_env.yml'
+	threads: 16
+	shell:
+		'''
+		samtools flagstat {input.BAM} > {output.textout} 
+		'''
+
+rule ATACseqQC:
+	input: 
+		sorted = 'results/shifted/{rep}_shifted_sorted.bam'
+	output:
+		out = 'results/{rep}_fragplot.jpeg'
+	conda:
+		'envs/ATACseqQC_env.yml'
+	shell:
+		'''
+		Rscript FragDist.R {input.sorted}
+		'''
+
+rule peak_calling:
+	input:
+		sorted = 'results/shifted/{rep}_shifted_sorted.bam'
+	output:
+		out = 'results/peaks/{rep}_peaks.narrowPeak'
+	params:
+		outdir = 'results/peaks'
+	conda:
+		'envs/MACS3_env.yml'
+	threads: 8
+	shell:
+		'''
+		macs3 callpeak -f BAMPE -t {input.sorted} -g hs -n {wildcards.rep} -B --outdir {params.outdir}
+		'''
+
+rule intersect_peaks:
+	input:
+		r1 = 'results/peaks/ATACrep3_peaks.narrowPeak',
+		r2 = 'results/peaks/ATACrep4_peaks.narrowPeak'
+	output:
+		out = 'results/peaks/intersect.bed'
+	conda:
+		'envs/bedtools_env.yml'
+	shell:
+		'''
+		bedtools intersect -a {input.r1} -b {input.r2} -f 0.5 > {output.out}
+		'''
+
+rule filter_blacklist:
+	input:
+		inp = 'results/peaks/intersect.bed',
+		black = 'hg38-blacklist.v2.bed'
+	output:
+		out = 'results/peaks/intersect_filtered.bed'
+	conda:
+		'envs/bedtools_env.yml'
+	shell:
+		'''
+		bedtools intersect -a {input.inp} -b {input.black} -v > {output.out}
+		'''
+
+rule motifs:
+	input:
+		bed = 'results/peaks/intersect_filtered.bed',
+		genome = 'results/index/GRCh38.primary_assembly.genome.fa'
+	output:
+		outdir = directory('results/analysis/motifs')
+	conda:
+		'envs/homer_env.yml'
+	shell:
+		'''
+		findMotifsGenome.pl {input.bed} {input.genome} {output.outdir}
+		'''
+
+rule annotate_peaks:
+	input:
+		bed = 'results/peaks/intersect_filtered.bed',
+		gtf = 'results/index/gencode.v45.primary_assembly.annotation.gtf'
+	output:
+		annotate = 'results/analysis/annotated.txt'
+	params:
+		genome = 'results/index/GRCh38.primary_assembly.genome.fa'
+	conda:
+		'envs/homer_env.yml'
+	shell:
+		'''
+		annotatePeaks.pl {input.bed} {params.genome} -gtf {input.gtf} > {output.annotate}
+		'''
+
+rule bamCoverage_NFR:
+	input:
+		BAM = 'results/shifted/{rep}_shifted_sorted.bam',
+		idx = 'results/shifted/{rep}_shifted_sorted.done'
+	output:
+		out = 'results/shifted/{rep}_NFR_coverage.bw'
+	threads: 4
+	conda:
+		'envs/deeptools_env.yml'
+	shell:
+		'''
+		bamCoverage -b {input.BAM} --maxFragmentLength 100 -o {output.out} -p {threads}
+		'''
+
+rule bamCoverage_NBR:
+	input:
+		BAM = 'results/shifted/{rep}_shifted_sorted.bam',
+		idx = 'results/shifted/{rep}_shifted_sorted.done'
+	output:
+		out = 'results/shifted/{rep}_NBR_coverage.bw'
+	threads: 4
+	conda:
+		'envs/deeptools_env.yml'
+	shell:
+		'''
+		bamCoverage -b {input.BAM} --minFragmentLength 180 --maxFragmentLength 247 -o {output.out} -p {threads}
+		'''
+
+rule computeMatrix:
+	input:
+		exp = 'results/shifted/{reps}_coverage.bw'
+	output:
+		out = 'results/matrix_{reps}.gz'
+	params:
+		ref = 'results/index/hg38_genes.bed'
+	conda:
+		'envs/deeptools_env.yml'
+	threads: 4
+	shell:
+		'''
+		computeMatrix reference-point -S {input.exp} -R {params.ref} -a 2000 -b 2000 -o {output.out} -p {threads}
+		'''
+
+
+rule plotMatrix:
+	input:
+		matrix = 'results/matrix_{rep}.gz'
+	output:
+		out = 'results/matrixplot_{rep}.png'
+	conda:
+		'envs/deeptools_env.yml'
+	shell:
+		'''
+		plotProfile -m {input.matrix} -o {output.out}
+		'''
+
+
